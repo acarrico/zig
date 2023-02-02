@@ -874,6 +874,44 @@ test "writev longer than IOV_MAX" {
     try testing.expectEqual(@as(usize, os.IOV_MAX), amt);
 }
 
+// ISSUE: This is just a temporary test to see if the libc fcntl fails on aarch64.
+//
+// See https://github.com/ziglang/zig/pull/13926
+
+const c = @cImport({
+    if (builtin.link_libc) {
+        @cInclude("fcntl.h");
+        @cInclude("errno.h");
+    }
+    else {
+        @compileError("POSIX file locking with fcntl test requires link_libc");
+    }
+});
+
+pub fn cFcntl(fd: std.os.fd_t, cmd: i32, arg: usize) std.os.FcntlError!usize {
+    while (true) {
+        const rc = c.fcntl(fd, cmd, arg);
+        if (rc == -1) {
+            switch(@intToEnum(std.os.E, c.__errno_location().*)) {
+                .SUCCESS => return @intCast(usize, rc),
+                .INTR => continue,
+                .AGAIN, .ACCES => return error.Locked,
+                .BADF => unreachable,
+                .BUSY => return error.FileBusy,
+                .INVAL => unreachable, // invalid parameters
+                .PERM => return error.PermissionDenied,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NOTDIR => unreachable, // invalid parameter
+                .DEADLK => return error.DeadLock,
+                .NOLCK => return error.LockedRegionLimitExceeded,
+                else => |err| return std.os.unexpectedErrno(err),
+            }
+        } else {
+            return @intCast(usize, rc);
+        }
+    }
+}
+
 test "POSIX file locking with fcntl" {
     if (native_os == .windows or native_os == .wasi) {
         // Not POSIX.
@@ -901,26 +939,27 @@ test "POSIX file locking with fcntl" {
     struct_flock.len = 1;
     struct_flock.type = std.os.F.WRLCK;
     struct_flock.whence = std.os.SEEK.SET;
-    _ = try std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
+
+    _ = try cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
 
     const pid = try std.os.fork();
     if (pid == 0) {
         // The child prepares the exclusive lock:
         struct_flock.start = 0;
         struct_flock.type = std.os.F.WRLCK;
-        _ = try std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
+        _ = try cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
         // child prepares the shared lock:
         struct_flock.start = 1;
         struct_flock.type = std.os.F.RDLCK;
-        _ = try std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
+        _ = try cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
         // child signals the parent to proceed:
         struct_flock.start = 2;
         struct_flock.type = std.os.F.WRLCK;
-        _ = try std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
+        _ = try cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
         // child waits for the parent to finish:
         struct_flock.start = 3;
         struct_flock.type = std.os.F.WRLCK;
-        _ = try std.os.fcntl(fd, std.os.F.SETLKW, @ptrToInt(&struct_flock));
+        _ = try cFcntl(fd, std.os.F.SETLKW, @ptrToInt(&struct_flock));
         // child exits without continuing:
         std.os.exit(0);
     } else {
@@ -930,7 +969,7 @@ test "POSIX file locking with fcntl" {
             struct_flock.len = 1;
             struct_flock.whence = std.os.SEEK.SET;
             struct_flock.type = std.os.F.WRLCK;
-            _ = try std.os.fcntl(fd, std.os.F.GETLK, @ptrToInt(&struct_flock));
+            _ = try cFcntl(fd, std.os.F.GETLK, @ptrToInt(&struct_flock));
             if (struct_flock.type == std.os.F.UNLCK) {
                 std.time.sleep(1 * std.time.ns_per_ms);
             } else break;
@@ -940,23 +979,23 @@ test "POSIX file locking with fcntl" {
         struct_flock.len = 1;
         struct_flock.whence = std.os.SEEK.SET;
         struct_flock.type = std.os.F.WRLCK;
-        try expectError(error.Locked, std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock)));
+        try expectError(error.Locked, cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock)));
         // parent expects to get the shared lock:
         struct_flock.start = 1;
         struct_flock.type = std.os.F.RDLCK;
-        _ = try std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
+        _ = try cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
         // parent expects deadlock when attempting to upgrade the shared lock to exclusive:
         struct_flock.start = 1;
         struct_flock.type = std.os.F.WRLCK;
-        try expectError(error.DeadLock, std.os.fcntl(fd, std.os.F.SETLKW, @ptrToInt(&struct_flock)));
+        try expectError(error.DeadLock, cFcntl(fd, std.os.F.SETLKW, @ptrToInt(&struct_flock)));
         // parent signals child to finish:
         struct_flock.start = 3;
         struct_flock.type = std.os.F.UNLCK;
-        _ = try std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
+        _ = try cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
         // parent releases shared lock:
         struct_flock.start = 1;
         struct_flock.type = std.os.F.UNLCK;
-        _ = try std.os.fcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
+        _ = try cFcntl(fd, std.os.F.SETLK, @ptrToInt(&struct_flock));
         // parent waits for child:
         const result = std.os.waitpid(pid, 0);
         try expect(result.status == 0 * 256);
